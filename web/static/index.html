@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>2D Navier-Stokes CFD Simulator | Airfoil & Turbofan Cascade</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <!-- Chart.js for live aerodynamic telemetry & Cp distribution -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="app-container">
+    <!-- Top Bar -->
+    <header class="top-nav">
+      <div class="nav-brand">
+        <div class="logo-badge">CFD-2D</div>
+        <div class="brand-text">
+          <h1>Navier-Stokes Simulator</h1>
+          <span class="subtitle">Incompressible Staggered MAC Flow Solver</span>
+        </div>
+      </div>
+
+      <div class="mode-tabs">
+        <button class="mode-btn active" data-mode="airfoil">Single Airfoil</button>
+        <button class="mode-btn" data-mode="cascade">Turbofan Cascade</button>
+        <button class="mode-btn" data-mode="cylinder">Cylinder Vortex</button>
+        <button class="mode-btn" data-mode="cavity">Lid Cavity</button>
+      </div>
+
+      <div class="nav-actions">
+        <button id="btn-play" class="btn btn-primary">
+          <span id="play-icon">▶</span> <span id="play-text">Pause</span>
+        </button>
+        <button id="btn-step" class="btn btn-secondary">Step</button>
+        <button id="btn-reset" class="btn btn-danger">Reset</button>
+        <div class="status-indicator">
+          <span class="dot live"></span>
+          <span id="fps-counter">30 FPS</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Workspace -->
+    <main class="main-layout">
+      <!-- Left Sidebar: Controls -->
+      <aside class="control-panel">
+        <div class="panel-section">
+          <h2 class="section-title">Flow Parameters</h2>
+          <div class="form-group">
+            <div class="label-row">
+              <label for="slider-re">Reynolds Number (Re)</label>
+              <span id="val-re" class="val-badge">500</span>
+            </div>
+            <input type="range" id="slider-re" min="50" max="5000" step="50" value="500">
+          </div>
+
+          <div id="airfoil-controls">
+            <div class="form-group">
+              <div class="label-row">
+                <label for="slider-aoa">Angle of Attack (&alpha;)</label>
+                <span id="val-aoa" class="val-badge">+4.0&deg;</span>
+              </div>
+              <input type="range" id="slider-aoa" min="-20" max="25" step="0.5" value="4">
+            </div>
+
+            <div class="form-group">
+              <label for="input-naca">NACA 4-Digit Code</label>
+              <div class="input-action-row">
+                <input type="text" id="input-naca" value="0012" maxlength="4" placeholder="0012">
+                <button id="btn-apply-naca" class="btn btn-sm btn-accent">Apply</button>
+              </div>
+              <div class="quick-presets">
+                <span class="preset-label">Presets:</span>
+                <button class="chip" data-naca="0012">0012 (Symmetric)</button>
+                <button class="chip" data-naca="2412">2412 (Light Camber)</button>
+                <button class="chip" data-naca="4412">4412 (High Camber)</button>
+                <button class="chip" data-naca="6412">6412 (Turbine)</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Cascade Controls (visible in cascade mode) -->
+          <div id="cascade-controls" class="hidden">
+            <div class="form-group">
+              <div class="label-row">
+                <label for="slider-stagger">Stagger Angle (&gamma;)</label>
+                <span id="val-stagger" class="val-badge">25.0&deg;</span>
+              </div>
+              <input type="range" id="slider-stagger" min="-45" max="45" step="1" value="25">
+            </div>
+
+            <div class="form-group">
+              <div class="label-row">
+                <label for="slider-pitch">Solidity / Pitch (s/c)</label>
+                <span id="val-pitch" class="val-badge">1.50</span>
+              </div>
+              <input type="range" id="slider-pitch" min="0.8" max="2.5" step="0.1" value="1.5">
+            </div>
+
+            <div class="form-group">
+              <div class="label-row">
+                <label for="slider-inlet-angle">Inlet Flow Angle (&beta;<sub>1</sub>)</label>
+                <span id="val-inlet-angle" class="val-badge">25.0&deg;</span>
+              </div>
+              <input type="range" id="slider-inlet-angle" min="0" max="45" step="1" value="25">
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-section">
+          <h2 class="section-title">Visualization Options</h2>
+          <div class="form-group">
+            <label for="select-field">Scalar Field</label>
+            <select id="select-field" class="form-select">
+              <option value="vorticity" selected>Vorticity (&omega; = &part;v/&part;x - &part;u/&part;y)</option>
+              <option value="speed">Velocity Magnitude (|u|)</option>
+              <option value="pressure">Kinematic Pressure (p)</option>
+              <option value="divergence">Mass Conservation (&nabla;&middot;u)</option>
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label for="select-colormap">Colormap</label>
+            <select id="select-colormap" class="form-select">
+              <option value="viridis" selected>Viridis (Perceptually Uniform)</option>
+              <option value="inferno">Inferno (High Contrast Flame)</option>
+              <option value="coolwarm">CoolWarm (Divergent Blue-Red)</option>
+            </select>
+          </div>
+
+          <div class="toggle-group">
+            <label class="toggle-switch">
+              <input type="checkbox" id="toggle-particles" checked>
+              <span class="slider"></span>
+            </label>
+            <span class="toggle-label">Particle Tracers / Streaklines</span>
+          </div>
+
+          <div class="form-group" style="margin-top: 12px;">
+            <label for="select-resolution">Grid Resolution</label>
+            <select id="select-resolution" class="form-select">
+              <option value="fast">Fast (128 &times; 64)</option>
+              <option value="standard" selected>Standard (192 &times; 96)</option>
+              <option value="high">High Detail (256 &times; 128)</option>
+            </select>
+          </div>
+        </div>
+      </aside>
+
+      <!-- Center: Canvas Viewport -->
+      <section class="canvas-viewport">
+        <div class="viewport-header">
+          <div class="view-tag" id="view-mode-tag">MODE: Isolated NACA 0012 Airfoil</div>
+          <div class="view-stats">
+            <span>Sim Time: <strong id="stat-time">0.00s</strong></span>
+            <span>&Delta;t: <strong id="stat-dt">0.010s</strong></span>
+            <span>Step: <strong id="stat-step">0</strong></span>
+          </div>
+        </div>
+
+        <div class="canvas-wrapper">
+          <canvas id="cfd-canvas" width="960" height="480"></canvas>
+          <div class="colorbar-container">
+            <div class="colorbar-bar" id="colorbar-gradient"></div>
+            <div class="colorbar-labels">
+              <span id="cb-max">+2.50</span>
+              <span id="cb-mid">0.00</span>
+              <span id="cb-min">-2.50</span>
+            </div>
+            <div class="colorbar-title" id="cb-title">&omega;</div>
+          </div>
+        </div>
+
+        <!-- Telemetry Bottom Bar -->
+        <div class="telemetry-bar">
+          <div class="metric-card">
+            <div class="metric-label">Lift Coeff (C<sub>l</sub>)</div>
+            <div class="metric-value" id="hud-cl">0.0000</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Drag Coeff (C<sub>d</sub>)</div>
+            <div class="metric-value" id="hud-cd">0.0000</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Efficiency (L/D)</div>
+            <div class="metric-value" id="hud-ld">0.00</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">RMS Divergence</div>
+            <div class="metric-value metric-good" id="hud-div">1.2e-05</div>
+          </div>
+
+          <!-- Cascade Specific Metrics -->
+          <div class="metric-card hidden" id="card-turning">
+            <div class="metric-label">Turning Angle (&Delta;&beta;)</div>
+            <div class="metric-value" id="hud-turning">0.0&deg;</div>
+          </div>
+          <div class="metric-card hidden" id="card-loss">
+            <div class="metric-label">Total Press Loss (Y<sub>p</sub>)</div>
+            <div class="metric-value" id="hud-yp">0.000</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Right Sidebar: Interactive Plots -->
+      <aside class="chart-panel" id="chart-panel">
+        <div class="chart-box">
+          <div class="chart-header">
+            <h3>Surface Pressure Coeff (C<sub>p</sub> vs x/c)</h3>
+            <span class="badge">Inviscid / Viscous</span>
+          </div>
+          <div class="chart-canvas-container">
+            <canvas id="chart-cp"></canvas>
+          </div>
+        </div>
+
+        <div class="chart-box">
+          <div class="chart-header">
+            <h3>Aerodynamic History (C<sub>l</sub> &amp; C<sub>d</sub>)</h3>
+            <span class="badge">Transient Tracking</span>
+          </div>
+          <div class="chart-canvas-container">
+            <canvas id="chart-history"></canvas>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
