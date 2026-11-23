@@ -95,7 +95,13 @@ Python 3.10+ (tested on Python 3.11.9 on Windows).
 pip install -r requirements.txt
 ```
 
-### 3.3 Run the Web Simulator
+### 3.3 Run and Stop the Web Simulator
+
+**Quick Start (Windows):**
+- **To Start**: Double-click `run.bat` to launch the Uvicorn server and automatically open the simulation dashboard at `http://127.0.0.1:8000`.
+- **To Stop**: Double-click `stop.bat` to safely terminate the server and free up port 8000.
+
+**Manual Launch (Command Line):**
 Launch the FastAPI server:
 ```bash
 python -m uvicorn web.server:app --host 127.0.0.1 --port 8000 --reload
