@@ -9,7 +9,7 @@ Developed for interactive exploration, aerodynamic design intuition, and physica
 ## 1. Architectural Overview & File Structure
 
 ```
-LAUC Sem 1and2 FAP/
+LAUC Project/
 ├── solver/
 │   ├── __init__.py         # Package exports
 │   ├── grid.py             # Staggered MAC grid coordinate transforms & metrics

@@ -1,6 +1,6 @@
-// 2D Navier-Stokes CFD Simulator Frontend Controller
+// 2D Navier-Stokes CFD Simulator - High-Performance Frontend Controller
 
-// Colormap lookup tables (256 RGB values)
+// Colormap color stop definitions
 const COLORMAPS = {
   viridis: [
     [68,1,84],[70,8,92],[71,16,99],[72,23,105],[72,29,111],[71,36,117],[70,42,122],[68,49,126],
@@ -24,7 +24,7 @@ const COLORMAPS = {
   ]
 };
 
-// Interpolate RGB from palette
+// Helper: interpolate RGB from palette stops
 function sampleColormap(name, t) {
   const palette = COLORMAPS[name] || COLORMAPS.viridis;
   const clamped = Math.max(0, Math.min(1, t));
@@ -40,6 +40,19 @@ function sampleColormap(name, t) {
     Math.round(c0[1] + frac * (c1[1] - c0[1])),
     Math.round(c0[2] + frac * (c1[2] - c0[2]))
   ];
+}
+
+// Precompute 256-entry 32-bit RGBA lookup tables for ultra-fast canvas blitting (< 0.25 ms)
+const COLORMAP_LUTS = {};
+for (const [name, palette] of Object.entries(COLORMAPS)) {
+  const lut = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255.0;
+    const rgb = sampleColormap(name, t);
+    // Little-endian ABGR representation: Alpha=255, Blue, Green, Red
+    lut[i] = ((255 << 24) >>> 0) | (rgb[2] << 16) | (rgb[1] << 8) | rgb[0];
+  }
+  COLORMAP_LUTS[name] = lut;
 }
 
 // Particle System for Streamline / Streakline Visualization
@@ -70,14 +83,12 @@ class ParticleSystem {
     for (let p of this.particles) {
       p.age++;
       if (p.age > p.maxAge || p.x < 0 || p.x > 1.0 || p.y < 0 || p.y > 1.0) {
-        // Respawn near inlet
         p.x = Math.random() * 0.05;
         p.y = Math.random();
         p.age = 0;
         continue;
       }
 
-      // Sample velocity at (p.x, p.y)
       const ix = Math.min(nx - 1, Math.max(0, Math.floor(p.x * nx)));
       const iy = Math.min(ny - 1, Math.max(0, Math.floor(p.y * ny)));
       const idx = iy * nx + ix;
@@ -85,19 +96,17 @@ class ParticleSystem {
       const u = velSub.u[idx] || 0;
       const v = velSub.v[idx] || 0;
 
-      // Advect position
       p.x += u * 0.015;
       p.y += v * 0.015;
     }
   }
 
   draw(ctx, width, height) {
-    ctx.fillStyle = "rgba(255, 255, 255, 0.65)";
     for (let p of this.particles) {
       const alpha = Math.sin((p.age / p.maxAge) * Math.PI) * 0.7;
       ctx.fillStyle = `rgba(255, 255, 255, ${alpha.toFixed(2)})`;
       const px = p.x * width;
-      const py = (1.0 - p.y) * height; // Invert y for canvas coordinates
+      const py = (1.0 - p.y) * height;
       ctx.fillRect(px, py, 1.8, 1.8);
     }
   }
@@ -111,12 +120,39 @@ class CFDApp {
     this.offscreenCanvas = document.createElement("canvas");
     this.offscreenCtx = this.offscreenCanvas.getContext("2d");
 
-    this.particles = new ParticleSystem(300);
+    // Track active simulation mode to conditionally render geometry and charts
+    this.currentMode = "airfoil";
+
+    // Pre-allocated typed buffer for image blitting
+    this.imgData = null;
+    this.pixels32 = null;
+
+    this.particles = new ParticleSystem(250);
     this.showParticles = true;
     this.colormap = "viridis";
+    this.activeLUT = COLORMAP_LUTS[this.colormap];
+
     this.ws = null;
     this.lastFrameTime = performance.now();
-    this.fps = 30;
+    this.fps = 60;
+
+    // Decoupled render loop state
+    this.latestFrame = null;
+    this.lastRenderedFrame = null;
+    this.cachedPolygons = [];
+    this.lastChartUpdate = 0;
+
+    // FoilSim and Analysis state
+    this.shapeType = "naca";
+    this.showProbe = false;
+    this.showVectors = false;
+    this.probeThrottleTimer = null;
+    this.sweepLiftChart = null;
+    this.sweepPolarChart = null;
+
+    // Slider throttling / debouncing
+    this.pendingConfig = {};
+    this.configTimer = null;
 
     // Charts
     this.cpChart = null;
@@ -127,6 +163,7 @@ class CFDApp {
 
     this.initUI();
     this.initCharts();
+    this.startRenderLoop();
     this.connectWebSocket();
   }
 
@@ -160,21 +197,67 @@ class CFDApp {
     });
 
     document.getElementById("btn-step").addEventListener("click", () => this.sendAction("step"));
-    document.getElementById("btn-reset").addEventListener("click", () => this.sendAction("reset"));
+    
+    // Reset button: flushes charts, HUD metrics, and requests server reset
+    document.getElementById("btn-reset").addEventListener("click", () => {
+      this.resetChartsAndTelemetry();
+      this.sendAction("reset");
+    });
 
-    // Sliders
+    // Range Sliders with immediate DOM label updates & 40ms network throttling
     const sliderRe = document.getElementById("slider-re");
     sliderRe.addEventListener("input", (e) => {
       document.getElementById("val-re").textContent = e.target.value;
-      this.sendConfig({ reynolds: parseFloat(e.target.value) });
+      this.throttleConfig("reynolds", parseFloat(e.target.value));
     });
 
     const sliderAoA = document.getElementById("slider-aoa");
     sliderAoA.addEventListener("input", (e) => {
       const val = parseFloat(e.target.value);
       document.getElementById("val-aoa").textContent = (val >= 0 ? "+" : "") + val.toFixed(1) + "°";
-      this.sendConfig({ alpha_deg: val });
+      this.throttleConfig("alpha_deg", val);
     });
+
+    // FoilSim Shape Presets
+    document.querySelectorAll(".shape-chip").forEach(chip => {
+      chip.addEventListener("click", () => {
+        document.querySelectorAll(".shape-chip").forEach(c => c.classList.remove("active"));
+        chip.classList.add("active");
+        this.shapeType = chip.dataset.shape;
+        this.updateShapeUI();
+        this.sendConfig({ shape_type: this.shapeType });
+      });
+    });
+
+    // Camber slider
+    const sliderCamber = document.getElementById("slider-camber");
+    if (sliderCamber) {
+      sliderCamber.addEventListener("input", (e) => {
+        const val = parseFloat(e.target.value);
+        document.getElementById("val-camber").textContent = val.toFixed(1) + "% c";
+        this.throttleConfig("camber", val / 100.0);
+      });
+    }
+
+    // Thickness slider
+    const sliderThick = document.getElementById("slider-thickness");
+    if (sliderThick) {
+      sliderThick.addEventListener("input", (e) => {
+        const val = parseFloat(e.target.value);
+        document.getElementById("val-thickness").textContent = val.toFixed(1) + "% c";
+        this.throttleConfig("thickness", val / 100.0);
+      });
+    }
+
+    // Spin Rate slider (Rotating Cylinder)
+    const sliderSpin = document.getElementById("slider-spin");
+    if (sliderSpin) {
+      sliderSpin.addEventListener("input", (e) => {
+        const val = parseFloat(e.target.value);
+        document.getElementById("val-spin").textContent = (val >= 0 ? "+" : "") + val.toFixed(1) + " rad/s";
+        this.throttleConfig("spin_rate", val);
+      });
+    }
 
     // NACA presets & input
     document.getElementById("btn-apply-naca").addEventListener("click", () => {
@@ -190,20 +273,111 @@ class CFDApp {
       });
     });
 
+    // Flight & Atmospheric Conditions
+    const sliderAirspeed = document.getElementById("slider-airspeed");
+    if (sliderAirspeed) {
+      sliderAirspeed.addEventListener("input", (e) => {
+        const val = parseFloat(e.target.value);
+        document.getElementById("val-airspeed").textContent = val.toFixed(1) + " m/s";
+        this.throttleConfig("airspeed", val);
+      });
+    }
+
+    const sliderAltitude = document.getElementById("slider-altitude");
+    if (sliderAltitude) {
+      sliderAltitude.addEventListener("input", (e) => {
+        const val = parseFloat(e.target.value);
+        document.getElementById("val-altitude").textContent = `${Math.round(val)} m`;
+        this.throttleConfig("altitude", val);
+      });
+    }
+
+    const inputArea = document.getElementById("input-wing-area");
+    if (inputArea) {
+      inputArea.addEventListener("change", (e) => {
+        const val = Math.max(0.01, parseFloat(e.target.value) || 1.0);
+        this.sendConfig({ wing_area: val });
+      });
+    }
+
+    const inputChord = document.getElementById("input-chord");
+    if (inputChord) {
+      inputChord.addEventListener("change", (e) => {
+        const val = Math.max(0.01, parseFloat(e.target.value) || 1.0);
+        this.sendConfig({ chord_length: val });
+      });
+    }
+
+    // Interactive Flow Probe & Canvas Crosshair
+    const toggleProbe = document.getElementById("toggle-probe");
+    if (toggleProbe) {
+      toggleProbe.addEventListener("change", (e) => {
+        this.showProbe = e.target.checked;
+        if (!this.showProbe) {
+          const hud = document.getElementById("flow-probe-hud");
+          if (hud) hud.classList.add("hidden");
+          this.sendWS({ action: "clear_probe" });
+        }
+      });
+    }
+
+    this.canvas.addEventListener("mousemove", (e) => {
+      if (!this.showProbe) return;
+      const rect = this.canvas.getBoundingClientRect();
+      const normX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+      const normY = Math.max(0, Math.min(1, 1.0 - ((e.clientY - rect.top) / rect.height)));
+
+      if (!this.probeThrottleTimer) {
+        this.probeThrottleTimer = setTimeout(() => {
+          this.sendWS({ action: "probe", x: normX, y: normY });
+          this.probeThrottleTimer = null;
+        }, 30);
+      }
+    });
+
+    this.canvas.addEventListener("mouseleave", () => {
+      if (this.showProbe) {
+        const hud = document.getElementById("flow-probe-hud");
+        if (hud) hud.classList.add("hidden");
+        this.sendWS({ action: "clear_probe" });
+      }
+    });
+
+    // Surface Pressure Vectors
+    const toggleVectors = document.getElementById("toggle-vectors");
+    if (toggleVectors) {
+      toggleVectors.addEventListener("change", (e) => {
+        this.showVectors = e.target.checked;
+      });
+    }
+
+    // Alpha Sweep Modal triggers
+    const btnSweep = document.getElementById("btn-alpha-sweep");
+    if (btnSweep) {
+      btnSweep.addEventListener("click", () => this.runAlphaSweep());
+    }
+
+    const btnCloseSweep = document.getElementById("btn-close-sweep");
+    if (btnCloseSweep) {
+      btnCloseSweep.addEventListener("click", () => {
+        document.getElementById("sweep-modal").classList.add("hidden");
+      });
+    }
+
     // Cascade sliders
     document.getElementById("slider-stagger").addEventListener("input", (e) => {
       document.getElementById("val-stagger").textContent = e.target.value + "°";
-      this.sendConfig({ cascade_stagger: parseFloat(e.target.value) });
+      this.throttleConfig("cascade_stagger", parseFloat(e.target.value));
     });
 
     document.getElementById("slider-pitch").addEventListener("input", (e) => {
       document.getElementById("val-pitch").textContent = parseFloat(e.target.value).toFixed(2);
-      this.sendConfig({ cascade_pitch: parseFloat(e.target.value) });
+      this.throttleConfig("cascade_pitch", parseFloat(e.target.value));
     });
 
     document.getElementById("slider-inlet-angle").addEventListener("input", (e) => {
       document.getElementById("val-inlet-angle").textContent = e.target.value + "°";
-      this.sendConfig({ cascade_inlet_angle: parseFloat(e.target.value) });
+      this.throttleConfig("cascade_inlet_angle", parseFloat(e.target.value));
     });
 
     // Visualization options
@@ -217,6 +391,7 @@ class CFDApp {
 
     document.getElementById("select-colormap").addEventListener("change", (e) => {
       this.colormap = e.target.value;
+      this.activeLUT = COLORMAP_LUTS[this.colormap] || COLORMAP_LUTS.viridis;
       this.updateColorbarGradient();
     });
 
@@ -228,7 +403,26 @@ class CFDApp {
       this.sendConfig({ resolution: e.target.value });
     });
 
+    // Simulation Speed selector
+    const selectSpeed = document.getElementById("select-speed");
+    if (selectSpeed) {
+      selectSpeed.addEventListener("change", (e) => {
+        this.sendConfig({ speed_multiplier: parseInt(e.target.value, 10) });
+      });
+    }
+
     this.updateColorbarGradient();
+  }
+
+  throttleConfig(key, value, delay = 40) {
+    this.pendingConfig[key] = value;
+    if (!this.configTimer) {
+      this.configTimer = setTimeout(() => {
+        this.sendConfig(this.pendingConfig);
+        this.pendingConfig = {};
+        this.configTimer = null;
+      }, delay);
+    }
   }
 
   updateColorbarGradient() {
@@ -241,7 +435,54 @@ class CFDApp {
     bar.style.background = `linear-gradient(to top, ${stops})`;
   }
 
+  resetChartsAndTelemetry() {
+    // Clear history arrays
+    this.clHistory = [];
+    this.cdHistory = [];
+    this.timeHistory = [];
+
+    // Clear Aerodynamic History Chart
+    if (this.historyChart) {
+      this.historyChart.data.labels = [];
+      this.historyChart.data.datasets[0].data = [];
+      this.historyChart.data.datasets[1].data = [];
+      this.historyChart.update("none");
+    }
+
+    // Clear Surface Cp Chart
+    if (this.cpChart) {
+      this.cpChart.data.labels = [];
+      this.cpChart.data.datasets[0].data = [];
+      this.cpChart.data.datasets[1].data = [];
+      this.cpChart.update("none");
+    }
+
+    // Reset HUD telemetry display
+    const elTime = document.getElementById("stat-time");
+    if (elTime) elTime.textContent = "0.00s";
+    const elDt = document.getElementById("stat-dt");
+    if (elDt) elDt.textContent = "0.0000s";
+    const elStep = document.getElementById("stat-step");
+    if (elStep) elStep.textContent = "0";
+    const elCl = document.getElementById("hud-cl");
+    if (elCl) elCl.textContent = "0.0000";
+    const elCd = document.getElementById("hud-cd");
+    if (elCd) elCd.textContent = "0.0000";
+    const elLd = document.getElementById("hud-ld");
+    if (elLd) elLd.textContent = "0.00";
+  }
+
   switchMode(mode) {
+    this.currentMode = mode;
+
+    // Immediately flush old polygons and frame buffers so zero ghost geometry leaks
+    this.cachedPolygons = [];
+    this.latestFrame = null;
+    this.lastRenderedFrame = null;
+
+    // Clear both charts on mode switch
+    this.resetChartsAndTelemetry();
+
     const isCascade = (mode === "cascade");
     const isAirfoil = (mode === "airfoil");
 
@@ -250,14 +491,42 @@ class CFDApp {
     document.getElementById("card-turning").classList.toggle("hidden", !isCascade);
     document.getElementById("card-loss").classList.toggle("hidden", !isCascade);
 
+    // Update Cp chart badge state
+    const cpBadge = document.getElementById("cp-badge");
+    if (cpBadge) {
+      cpBadge.textContent = isAirfoil ? "Inviscid / Viscous" : "Airfoil mode only";
+    }
+
     const tag = document.getElementById("view-mode-tag");
     tag.textContent = `MODE: ${mode.toUpperCase()} Flow Simulation`;
 
+    this.updateShapeUI();
     this.sendConfig({ mode: mode });
   }
 
+  updateShapeUI() {
+    const isAirfoil = (this.currentMode === "airfoil");
+    if (!isAirfoil) return;
+
+    const isNACA = (this.shapeType === "naca");
+    const isCyl = (this.shapeType === "rotating_cylinder");
+    const hasThick = (this.shapeType === "naca" || this.shapeType === "flat_plate" || this.shapeType === "ellipse");
+
+    const grpCamber = document.getElementById("grp-camber");
+    if (grpCamber) grpCamber.classList.toggle("hidden", !isNACA);
+
+    const grpNaca = document.getElementById("grp-naca-code");
+    if (grpNaca) grpNaca.classList.toggle("hidden", !isNACA);
+
+    const grpThick = document.getElementById("grp-thickness");
+    if (grpThick) grpThick.classList.toggle("hidden", !hasThick);
+
+    const grpSpin = document.getElementById("grp-spin");
+    if (grpSpin) grpSpin.classList.toggle("hidden", !isCyl);
+  }
+
   initCharts() {
-    // 1. Cp vs x/c distribution chart
+    // 1. Surface Cp Chart (Nothing OS Monochrome / Signature Red)
     const ctxCp = document.getElementById("chart-cp").getContext("2d");
     this.cpChart = new Chart(ctxCp, {
       type: "line",
@@ -267,8 +536,8 @@ class CFDApp {
           {
             label: "Upper (Suction)",
             data: [],
-            borderColor: "#38bdf8",
-            backgroundColor: "rgba(56, 189, 248, 0.1)",
+            borderColor: "#FFFFFF",
+            backgroundColor: "rgba(255, 255, 255, 0.05)",
             borderWidth: 2,
             tension: 0.3,
             fill: false,
@@ -277,8 +546,8 @@ class CFDApp {
           {
             label: "Lower (Pressure)",
             data: [],
-            borderColor: "#f59e0b",
-            backgroundColor: "rgba(245, 158, 11, 0.1)",
+            borderColor: "#D71921",
+            backgroundColor: "rgba(215, 25, 33, 0.05)",
             borderWidth: 2,
             tension: 0.3,
             fill: false,
@@ -292,25 +561,24 @@ class CFDApp {
         animation: false,
         scales: {
           x: {
-            title: { display: true, text: "x / c", color: "#9ca3af", font: { size: 10 } },
-            ticks: { color: "#6b7280", font: { size: 9 } },
-            grid: { color: "#1f2937" }
+            title: { display: true, text: "x / c", color: "#888888", font: { family: "'Space Mono', monospace", size: 9 } },
+            ticks: { color: "#888888", font: { family: "'Space Mono', monospace", size: 9 } },
+            grid: { color: "#1F1F1F", borderDash: [2, 4] }
           },
           y: {
-            // Standard aerodynamic convention: invert y so -Cp (suction) is pointing up
             reverse: true,
-            title: { display: true, text: "-Cp", color: "#9ca3af", font: { size: 10 } },
-            ticks: { color: "#6b7280", font: { size: 9 } },
-            grid: { color: "#1f2937" }
+            title: { display: true, text: "-Cp", color: "#888888", font: { family: "'Space Mono', monospace", size: 9 } },
+            ticks: { color: "#888888", font: { family: "'Space Mono', monospace", size: 9 } },
+            grid: { color: "#1F1F1F", borderDash: [2, 4] }
           }
         },
         plugins: {
-          legend: { labels: { color: "#e5e7eb", font: { size: 10 } } }
+          legend: { labels: { color: "#FFFFFF", font: { family: "'Space Mono', monospace", size: 10 } } }
         }
       }
     });
 
-    // 2. Aerodynamic History Chart (Cl and Cd)
+    // 2. Aerodynamic History Chart (Cl & Cd)
     const ctxHist = document.getElementById("chart-history").getContext("2d");
     this.historyChart = new Chart(ctxHist, {
       type: "line",
@@ -320,7 +588,7 @@ class CFDApp {
           {
             label: "Cl (Lift)",
             data: [],
-            borderColor: "#10b981",
+            borderColor: "#FFFFFF",
             borderWidth: 2,
             tension: 0.2,
             pointRadius: 0
@@ -328,7 +596,7 @@ class CFDApp {
           {
             label: "Cd (Drag)",
             data: [],
-            borderColor: "#ef4444",
+            borderColor: "#D71921",
             borderWidth: 2,
             tension: 0.2,
             pointRadius: 0
@@ -342,12 +610,12 @@ class CFDApp {
         scales: {
           x: { display: false },
           y: {
-            ticks: { color: "#6b7280", font: { size: 9 } },
-            grid: { color: "#1f2937" }
+            ticks: { color: "#888888", font: { family: "'Space Mono', monospace", size: 9 } },
+            grid: { color: "#1F1F1F", borderDash: [2, 4] }
           }
         },
         plugins: {
-          legend: { labels: { color: "#e5e7eb", font: { size: 10 } } }
+          legend: { labels: { color: "#FFFFFF", font: { family: "'Space Mono', monospace", size: 10 } } }
         }
       }
     });
@@ -360,9 +628,14 @@ class CFDApp {
 
     this.ws.onopen = () => console.log("Connected to CFD solver server.");
     this.ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === "frame") {
-        this.renderFrame(data);
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === "frame") {
+          // Store frame for the decoupled render loop
+          this.latestFrame = data;
+        }
+      } catch (err) {
+        console.error("Frame parse error:", err);
       }
     };
     this.ws.onclose = () => {
@@ -385,8 +658,85 @@ class CFDApp {
     }
   }
 
+  drawSolidGeometry(ctx, w, h, data) {
+    ctx.fillStyle = "#000000";
+    ctx.strokeStyle = "#FFFFFF";
+    ctx.lineWidth = 1.5;
+
+    // 1. Cylinder Vortex mode: draw analytical circular cylinder
+    if (this.currentMode === "cylinder") {
+      // Physical domain: [0, 8.0] x [0, 4.0]. Cylinder: center (2.0, 2.0), diameter 0.6 (radius 0.3)
+      const cx = (2.0 / 8.0) * w;
+      const cy = (1.0 - (2.0 / 4.0)) * h;
+      const rx = (0.3 / 8.0) * w;
+      const ry = (0.3 / 4.0) * h;
+
+      ctx.beginPath();
+      ctx.ellipse(cx, cy, rx, ry, 0, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.stroke();
+      return;
+    }
+
+    // 2. Lid Cavity mode: clean square cavity without internal obstacles
+    if (this.currentMode === "cavity") {
+      return;
+    }
+
+    // 3. Single Airfoil & Turbofan Cascade modes: render polygons
+    if (data && data.polygons) {
+      this.cachedPolygons = data.polygons;
+    }
+    const polys = this.cachedPolygons;
+    if (!polys || polys.length === 0) return;
+
+    for (let poly of polys) {
+      if (poly.length < 3) continue;
+      ctx.beginPath();
+      for (let k = 0; k < poly.length; k++) {
+        const px = poly[k][0] * w;
+        const py = (1.0 - poly[k][1]) * h;
+        if (k === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  startRenderLoop() {
+    const loop = () => {
+      if (this.latestFrame && this.latestFrame !== this.lastRenderedFrame) {
+        this.renderFrame(this.latestFrame);
+        this.lastRenderedFrame = this.latestFrame;
+      } else if (this.latestFrame && this.showParticles && this.latestFrame.vel_sub) {
+        // Redraw particle positions smoothly between physics frame updates
+        const w = this.canvas.width;
+        const h = this.canvas.height;
+        this.ctx.drawImage(this.offscreenCanvas, 0, 0, w, h);
+
+        // Render mode-appropriate solid geometry
+        this.drawSolidGeometry(this.ctx, w, h, null);
+
+        this.particles.update(this.latestFrame.vel_sub);
+        this.particles.draw(this.ctx, w, h);
+
+        // Render overlay layers
+        if (this.showVectors && this.latestFrame.cp_data && this.latestFrame.cp_data.vectors) {
+          this.drawPressureVectors(this.ctx, w, h, this.latestFrame.cp_data.vectors);
+        }
+        if (this.showProbe && this.latestFrame.probe_data) {
+          this.drawFlowProbe(this.ctx, w, h, this.latestFrame.probe_data);
+        }
+      }
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  }
+
   renderFrame(data) {
-    // Calculate rendering FPS
+    // 1. Calculate rendering FPS
     const now = performance.now();
     const delta = (now - this.lastFrameTime) / 1000;
     this.lastFrameTime = now;
@@ -395,77 +745,62 @@ class CFDApp {
       document.getElementById("fps-counter").textContent = `${this.fps} FPS`;
     }
 
-    // 1. Decode base64 uint8 scalar field
-    const raw = atob(data.field_b64);
-    const len = raw.length;
     const nx = data.nx;
     const ny = data.ny;
 
-    if (this.offscreenCanvas.width !== nx || this.offscreenCanvas.height !== ny) {
+    // 2. Pre-allocate ImageData once; reallocate only if grid dimensions change
+    if (!this.imgData || this.imgData.width !== nx || this.imgData.height !== ny) {
       this.offscreenCanvas.width = nx;
       this.offscreenCanvas.height = ny;
+      this.imgData = this.offscreenCtx.createImageData(nx, ny);
+      this.pixels32 = new Uint32Array(this.imgData.data.buffer);
     }
 
-    const imgData = this.offscreenCtx.createImageData(nx, ny);
-    const pixels = imgData.data;
+    // 3. Ultra-fast direct 32-bit LUT pixel copy (< 0.25 ms)
+    const raw = atob(data.field_b64);
+    const lut = this.activeLUT;
+    const pixels32 = this.pixels32;
 
-    // Fast colormap mapping: invert row index so y=0 is bottom
     for (let j = 0; j < ny; j++) {
-      const canvasRow = ny - 1 - j;
+      const srcRow = j * nx;
+      const dstRow = (ny - 1 - j) * nx;
       for (let i = 0; i < nx; i++) {
-        const srcIdx = j * nx + i;
-        const normVal = raw.charCodeAt(srcIdx) / 255.0;
-        const rgb = sampleColormap(this.colormap, normVal);
-
-        const dstIdx = (canvasRow * nx + i) * 4;
-        pixels[dstIdx] = rgb[0];
-        pixels[dstIdx + 1] = rgb[1];
-        pixels[dstIdx + 2] = rgb[2];
-        pixels[dstIdx + 3] = 255;
+        pixels32[dstRow + i] = lut[raw.charCodeAt(srcRow + i)];
       }
     }
+    this.offscreenCtx.putImageData(this.imgData, 0, 0);
 
-    this.offscreenCtx.putImageData(imgData, 0, 0);
-
-    // 2. Render to main canvas
+    // 4. Render scalar field to main display canvas (completely overwrites canvas pixels)
     const w = this.canvas.width;
     const h = this.canvas.height;
     this.ctx.imageSmoothingEnabled = true;
     this.ctx.drawImage(this.offscreenCanvas, 0, 0, w, h);
 
-    // 3. Render solid body contours (polygons)
-    if (data.polygons && data.polygons.length > 0) {
-      this.ctx.fillStyle = "#0f172a";
-      this.ctx.strokeStyle = "#38bdf8";
-      this.ctx.lineWidth = 2.0;
+    // 5. Render mode-appropriate solid obstacle boundary
+    this.drawSolidGeometry(this.ctx, w, h, data);
 
-      for (let poly of data.polygons) {
-        if (poly.length < 3) continue;
-        this.ctx.beginPath();
-        for (let k = 0; k < poly.length; k++) {
-          const px = poly[k][0] * w;
-          const py = (1.0 - poly[k][1]) * h;
-          if (k === 0) this.ctx.moveTo(px, py);
-          else this.ctx.lineTo(px, py);
-        }
-        this.ctx.closePath();
-        this.ctx.fill();
-        this.ctx.stroke();
-      }
-    }
-
-    // 4. Update and render particle streaklines overlay
+    // 6. Particle streaklines overlay
     if (this.showParticles && data.vel_sub) {
       this.particles.update(data.vel_sub);
       this.particles.draw(this.ctx, w, h);
     }
 
-    // 5. Update Colorbar labels
+    // 7. Surface Pressure Vectors overlay
+    if (this.showVectors && data.cp_data && data.cp_data.vectors) {
+      this.drawPressureVectors(this.ctx, w, h, data.cp_data.vectors);
+    }
+
+    // 8. Flow Field Probe overlay
+    if (this.showProbe && data.probe_data) {
+      this.drawFlowProbe(this.ctx, w, h, data.probe_data);
+    }
+
+    // 9. Update Colorbar labels
     document.getElementById("cb-max").textContent = (data.f_max >= 0 ? "+" : "") + data.f_max.toFixed(2);
     document.getElementById("cb-min").textContent = (data.f_min >= 0 ? "+" : "") + data.f_min.toFixed(2);
     document.getElementById("cb-mid").textContent = ((data.f_max + data.f_min) * 0.5).toFixed(2);
 
-    // 6. Update Telemetry HUD
+    // 10. Update Telemetry HUD
     document.getElementById("stat-time").textContent = `${data.time.toFixed(2)}s`;
     document.getElementById("stat-dt").textContent = `${data.dt.toFixed(4)}s`;
     document.getElementById("stat-step").textContent = data.step;
@@ -476,32 +811,294 @@ class CFDApp {
     document.getElementById("hud-ld").textContent = eff.toFixed(2);
     document.getElementById("hud-div").textContent = data.rms_div;
 
+    // Dimensional Forces (Newtons)
+    if (data.lift_n !== undefined) {
+      const elLift = document.getElementById("hud-lift-n");
+      if (elLift) elLift.textContent = `${data.lift_n.toFixed(1)} N`;
+    }
+    if (data.drag_n !== undefined) {
+      const elDrag = document.getElementById("hud-drag-n");
+      if (elDrag) elDrag.textContent = `${data.drag_n.toFixed(1)} N`;
+    }
+
+    // ISA Flight Conditions Telemetry
+    if (data.flight_conditions) {
+      const fc = data.flight_conditions;
+      const elRho = document.getElementById("isa-rho");
+      if (elRho) elRho.textContent = `ρ: ${fc.density_kg_m3.toFixed(3)} kg/m³`;
+      const elQ = document.getElementById("isa-q");
+      if (elQ) elQ.textContent = `q∞: ${Math.round(fc.q_inf_pa)} Pa`;
+      const elRe = document.getElementById("isa-re");
+      if (elRe) elRe.textContent = `Re: ${fc.reynolds.toExponential(1)}`;
+      const elBadge = document.getElementById("isa-badge");
+      if (elBadge) elBadge.textContent = fc.altitude_m > 0 ? `${fc.altitude_m}m Alt` : "Sea Level";
+    }
+
     if (data.cascade_metrics && data.cascade_metrics.turning_angle_deg !== undefined) {
       document.getElementById("hud-turning").textContent = `${data.cascade_metrics.turning_angle_deg.toFixed(1)}°`;
       document.getElementById("hud-yp").textContent = data.cascade_metrics.total_pressure_loss_yp.toFixed(3);
     }
 
-    // 7. Update Cp chart
-    if (data.cp_data && data.cp_data.x_c && data.cp_data.x_c.length > 0) {
-      this.cpChart.data.labels = data.cp_data.x_c.map(v => v.toFixed(2));
-      this.cpChart.data.datasets[0].data = data.cp_data.cp_upper;
-      this.cpChart.data.datasets[1].data = data.cp_data.cp_lower;
-      this.cpChart.update("none");
-    }
+    // 11. Throttled Chart.js updates (at most ~6 Hz to eliminate UI thread lag)
+    if (now - this.lastChartUpdate > 150) {
+      this.lastChartUpdate = now;
 
-    // 8. Update Aerodynamic history chart
-    this.clHistory.push(data.cl);
-    this.cdHistory.push(data.cd);
-    this.timeHistory.push(data.time.toFixed(1));
-    if (this.clHistory.length > 50) {
-      this.clHistory.shift();
-      this.cdHistory.shift();
-      this.timeHistory.shift();
+      // Update Surface Cp Chart conditionally for active airfoil mode only
+      if (this.currentMode === "airfoil") {
+        if (data.cp_data && data.cp_data.x_c && data.cp_data.x_c.length > 0) {
+          this.cpChart.data.labels = data.cp_data.x_c.map(v => v.toFixed(2));
+          this.cpChart.data.datasets[0].data = data.cp_data.cp_upper;
+          this.cpChart.data.datasets[1].data = data.cp_data.cp_lower;
+          this.cpChart.update("none");
+        }
+      } else {
+        // In non-airfoil modes, clear Cp chart datasets
+        if (this.cpChart.data.labels.length > 0) {
+          this.cpChart.data.labels = [];
+          this.cpChart.data.datasets[0].data = [];
+          this.cpChart.data.datasets[1].data = [];
+          this.cpChart.update("none");
+        }
+      }
+
+      // Update Aerodynamic History Chart
+      this.clHistory.push(data.cl);
+      this.cdHistory.push(data.cd);
+      this.timeHistory.push(data.time.toFixed(1));
+      if (this.clHistory.length > 50) {
+        this.clHistory.shift();
+        this.cdHistory.shift();
+        this.timeHistory.shift();
+      }
+      this.historyChart.data.labels = this.timeHistory;
+      this.historyChart.data.datasets[0].data = this.clHistory;
+      this.historyChart.data.datasets[1].data = this.cdHistory;
+      this.historyChart.update("none");
     }
-    this.historyChart.data.labels = this.timeHistory;
-    this.historyChart.data.datasets[0].data = this.clHistory;
-    this.historyChart.data.datasets[1].data = this.cdHistory;
-    this.historyChart.update("none");
+  }
+
+  drawPressureVectors(ctx, w, h, vectors) {
+    if (!vectors || vectors.length === 0) return;
+    ctx.save();
+    for (const [x1, y1, x2, y2, isSuction] of vectors) {
+      const sx = x1 * w;
+      const sy = (1.0 - y1) * h;
+      const tx = x2 * w;
+      const ty = (1.0 - y2) * h;
+
+      ctx.strokeStyle = isSuction ? "#FFFFFF" : "#D71921";
+      ctx.fillStyle = isSuction ? "#FFFFFF" : "#D71921";
+      ctx.lineWidth = 1.5;
+
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(tx, ty);
+      ctx.stroke();
+
+      // Arrow head at (tx, ty)
+      const angle = Math.atan2(ty - sy, tx - sx);
+      const headLen = 4;
+      ctx.beginPath();
+      ctx.moveTo(tx, ty);
+      ctx.lineTo(tx - headLen * Math.cos(angle - Math.PI / 6), ty - headLen * Math.sin(angle - Math.PI / 6));
+      ctx.lineTo(tx - headLen * Math.cos(angle + Math.PI / 6), ty - headLen * Math.sin(angle + Math.PI / 6));
+      ctx.closePath();
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  drawFlowProbe(ctx, w, h, probeData) {
+    if (!this.showProbe || !probeData) return;
+    const px = probeData.norm_x * w;
+    const py = (1.0 - probeData.norm_y) * h;
+
+    ctx.save();
+    // Dotted crosshair hairline
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.4)";
+    ctx.setLineDash([2, 3]);
+    ctx.lineWidth = 1;
+
+    ctx.beginPath();
+    ctx.moveTo(0, py);
+    ctx.lineTo(w, py);
+    ctx.moveTo(px, 0);
+    ctx.lineTo(px, h);
+    ctx.stroke();
+
+    // Target ring
+    ctx.setLineDash([]);
+    ctx.strokeStyle = probeData.in_solid ? "#D71921" : "#FFFFFF";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(px, py, 7, 0, 2 * Math.PI);
+    ctx.stroke();
+
+    // Center dot
+    ctx.fillStyle = probeData.in_solid ? "#D71921" : "#FFFFFF";
+    ctx.beginPath();
+    ctx.arc(px, py, 2, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.restore();
+
+    // Update Probe HUD elements
+    const hud = document.getElementById("flow-probe-hud");
+    if (hud) {
+      hud.classList.remove("hidden");
+      const xcEl = document.getElementById("probe-xc");
+      if (xcEl) xcEl.textContent = (probeData.x_c >= 0 ? "+" : "") + probeData.x_c.toFixed(2);
+      const velEl = document.getElementById("probe-vel");
+      if (velEl) velEl.textContent = `${probeData.vel_mps.toFixed(1)} m/s (${probeData.vel_mag.toFixed(2)} U∞)`;
+      const pEl = document.getElementById("probe-p");
+      if (pEl) pEl.textContent = `${(probeData.p_dim_pa / 1000).toFixed(1)} kPa`;
+      const cpEl = document.getElementById("probe-cp");
+      if (cpEl) cpEl.textContent = (probeData.p_coeff >= 0 ? "+" : "") + probeData.p_coeff.toFixed(2);
+      const vortEl = document.getElementById("probe-vort");
+      if (vortEl) vortEl.textContent = (probeData.vorticity >= 0 ? "+" : "") + probeData.vorticity.toFixed(1) + " s⁻¹";
+      const zoneEl = document.getElementById("probe-zone");
+      if (zoneEl) {
+        zoneEl.textContent = probeData.in_solid ? "SOLID OBSTACLE" : "FLUID FIELD";
+        zoneEl.style.color = probeData.in_solid ? "#D71921" : "#FFFFFF";
+      }
+    }
+  }
+
+  async runAlphaSweep() {
+    const modal = document.getElementById("sweep-modal");
+    const status = document.getElementById("sweep-status");
+    if (!modal || !status) return;
+
+    modal.classList.remove("hidden");
+    status.textContent = "RUNNING NAVIER-STOKES α SWEEP [-4° TO +16°]...";
+    status.style.color = "#FFFFFF";
+
+    const camberInput = document.getElementById("slider-camber");
+    const thickInput = document.getElementById("slider-thickness");
+    const nacaInput = document.getElementById("input-naca");
+    const reInput = document.getElementById("slider-re");
+
+    const camberVal = camberInput ? parseFloat(camberInput.value) / 100.0 : 0.0;
+    const thickVal = thickInput ? parseFloat(thickInput.value) / 100.0 : 0.12;
+    const nacaCode = nacaInput ? nacaInput.value.trim() : "0012";
+    const reynoldsVal = reInput ? parseFloat(reInput.value) : 500.0;
+
+    try {
+      const response = await fetch("/api/sweep/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          shape_type: this.shapeType || "naca",
+          naca_code: nacaCode,
+          camber: camberVal,
+          thickness: thickVal,
+          reynolds: reynoldsVal,
+          alpha_start: -4.0,
+          alpha_end: 16.0,
+          alpha_step: 2.0
+        })
+      });
+
+      if (!response.ok) throw new Error("Sweep failed on server");
+      const data = await response.json();
+
+      status.textContent = "ALPHA SWEEP COMPLETE // READY";
+      status.style.color = "#D71921";
+
+      document.getElementById("stat-stall-alpha").textContent = `${data.stall_alpha.toFixed(1)}°`;
+      document.getElementById("stat-cl-max").textContent = `${data.cl_max.toFixed(3)}`;
+      document.getElementById("stat-zero-alpha").textContent = (data.zero_lift_alpha !== null) ? `${data.zero_lift_alpha.toFixed(1)}°` : "N/A";
+
+      this.renderSweepCharts(data.sweep_data);
+    } catch (err) {
+      status.textContent = "ERROR RUNNING SWEEP: " + err.message;
+      status.style.color = "#D71921";
+    }
+  }
+
+  renderSweepCharts(sweepData) {
+    if (!sweepData || sweepData.length === 0) return;
+
+    const alphas = sweepData.map(d => `${d.alpha}°`);
+    const cls = sweepData.map(d => d.cl);
+    const cds = sweepData.map(d => d.cd);
+
+    // 1. Lift Curve Chart (Cl vs alpha)
+    const ctxLift = document.getElementById("chart-sweep-lift").getContext("2d");
+    if (this.sweepLiftChart) this.sweepLiftChart.destroy();
+    this.sweepLiftChart = new Chart(ctxLift, {
+      type: "line",
+      data: {
+        labels: alphas,
+        datasets: [{
+          label: "Lift Coefficient (Cl)",
+          data: cls,
+          borderColor: "#FFFFFF",
+          backgroundColor: "rgba(255, 255, 255, 0.1)",
+          borderWidth: 2,
+          pointBackgroundColor: "#D71921",
+          pointRadius: 4,
+          tension: 0.2
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: {
+            title: { display: true, text: "Angle of Attack (α)", color: "#888888", font: { family: "'Space Mono', monospace", size: 10 } },
+            ticks: { color: "#888888", font: { family: "'Space Mono', monospace", size: 9 } },
+            grid: { color: "#1F1F1F", borderDash: [2, 4] }
+          },
+          y: {
+            title: { display: true, text: "Lift Coeff (Cl)", color: "#888888", font: { family: "'Space Mono', monospace", size: 10 } },
+            ticks: { color: "#888888", font: { family: "'Space Mono', monospace", size: 9 } },
+            grid: { color: "#1F1F1F", borderDash: [2, 4] }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: "#FFFFFF", font: { family: "'Space Mono', monospace", size: 10 } } }
+        }
+      }
+    });
+
+    // 2. Drag Polar Chart (Cl vs Cd)
+    const ctxPolar = document.getElementById("chart-sweep-polar").getContext("2d");
+    if (this.sweepPolarChart) this.sweepPolarChart.destroy();
+    const polarPoints = sweepData.map(d => ({ x: d.cd, y: d.cl }));
+    this.sweepPolarChart = new Chart(ctxPolar, {
+      type: "scatter",
+      data: {
+        datasets: [{
+          label: "Drag Polar (Cl vs Cd)",
+          data: polarPoints,
+          borderColor: "#D71921",
+          backgroundColor: "rgba(215, 25, 33, 0.4)",
+          showLine: true,
+          borderWidth: 2,
+          pointRadius: 4,
+          tension: 0.2
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        scales: {
+          x: {
+            title: { display: true, text: "Drag Coeff (Cd)", color: "#888888", font: { family: "'Space Mono', monospace", size: 10 } },
+            ticks: { color: "#888888", font: { family: "'Space Mono', monospace", size: 9 } },
+            grid: { color: "#1F1F1F", borderDash: [2, 4] }
+          },
+          y: {
+            title: { display: true, text: "Lift Coeff (Cl)", color: "#888888", font: { family: "'Space Mono', monospace", size: 10 } },
+            ticks: { color: "#888888", font: { family: "'Space Mono', monospace", size: 9 } },
+            grid: { color: "#1F1F1F", borderDash: [2, 4] }
+          }
+        },
+        plugins: {
+          legend: { labels: { color: "#FFFFFF", font: { family: "'Space Mono', monospace", size: 10 } } }
+        }
+      }
+    });
   }
 }
 

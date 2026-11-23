@@ -15,7 +15,8 @@ from reportlab.platypus import (
 )
 from reportlab.pdfgen import canvas
 
-REPORT_DIR = r"C:\Users\OneX1\LAUC Sem 1and2 FAP\report"
+REPORT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(REPORT_DIR)
 os.makedirs(REPORT_DIR, exist_ok=True)
 
 DOCX_PATH = os.path.join(REPORT_DIR, "Simple_Review_Guide.docx")
@@ -152,7 +153,7 @@ def create_docx(filename):
         "Computational Fluid Dynamics (CFD) is the modern alternative: using math and computer code to simulate the air instead."
     )
     doc.add_paragraph(
-        "This project, located in the folder 'LAUC Sem 1and2 FAP', is a complete, self-contained 2D CFD simulation system. "
+        "This project, located in the folder 'LAUC Project', is a complete, self-contained 2D CFD simulation system. "
         "Unlike complex industrial programs that require expensive software licenses or supercomputers, this entire system runs directly on a standard laptop in Python, "
         "accelerated by high-speed math tools, and streams the visual flow live into your web browser at http://127.0.0.1:8000."
     )
@@ -541,7 +542,7 @@ def create_pdf(filename):
         body_style
     ))
     story.append(Paragraph(
-        "This project, located in the folder <i>LAUC Sem 1and2 FAP</i>, is a complete, self-contained 2D CFD simulation system. "
+        "This project, located in the folder <i>LAUC Project</i>, is a complete, self-contained 2D CFD simulation system. "
         "Unlike complex industrial programs that require expensive software licenses or supercomputers, this entire system runs directly on a standard laptop in Python, "
         "accelerated by high-speed math tools, and streams the visual flow live into your web browser at <b>http://127.0.0.1:8000</b>.",
         body_style

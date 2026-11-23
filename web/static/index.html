@@ -3,7 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>2D Navier-Stokes CFD Simulator | Airfoil & Turbofan Cascade</title>
+  <title>NAVIER-STOKES SIMULATOR | 2D CFD</title>
+  <!-- Google Fonts: DotGothic16 (Dot-Matrix) & Space Mono (Monospace) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DotGothic16&family=Space+Mono:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
   <!-- Chart.js for live aerodynamic telemetry & Cp distribution -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -15,7 +19,7 @@
       <div class="nav-brand">
         <div class="logo-badge">CFD-2D</div>
         <div class="brand-text">
-          <h1>Navier-Stokes Simulator</h1>
+          <h1>NAVIER-STOKES SIMULATOR</h1>
           <span class="subtitle">Incompressible Staggered MAC Flow Solver</span>
         </div>
       </div>
@@ -55,6 +59,17 @@
           </div>
 
           <div id="airfoil-controls">
+            <!-- FoilSim Shape Presets -->
+            <div class="form-group">
+              <label>FoilSim Geometry</label>
+              <div class="shape-chips">
+                <button class="shape-chip active" data-shape="naca">NACA Airfoil</button>
+                <button class="shape-chip" data-shape="flat_plate">Flat Plate</button>
+                <button class="shape-chip" data-shape="ellipse">Ellipse</button>
+                <button class="shape-chip" data-shape="rotating_cylinder">Rotating Cyl</button>
+              </div>
+            </div>
+
             <div class="form-group">
               <div class="label-row">
                 <label for="slider-aoa">Angle of Attack (&alpha;)</label>
@@ -63,7 +78,34 @@
               <input type="range" id="slider-aoa" min="-20" max="25" step="0.5" value="4">
             </div>
 
-            <div class="form-group">
+            <!-- Camber Slider (NACA) -->
+            <div class="form-group" id="grp-camber">
+              <div class="label-row">
+                <label for="slider-camber">Camber (m / chord)</label>
+                <span id="val-camber" class="val-badge">0.0% c</span>
+              </div>
+              <input type="range" id="slider-camber" min="0" max="10" step="0.5" value="0">
+            </div>
+
+            <!-- Thickness Slider (NACA, Flat Plate, Ellipse) -->
+            <div class="form-group" id="grp-thickness">
+              <div class="label-row">
+                <label for="slider-thickness">Thickness (t / chord)</label>
+                <span id="val-thickness" class="val-badge">12.0% c</span>
+              </div>
+              <input type="range" id="slider-thickness" min="2" max="25" step="0.5" value="12">
+            </div>
+
+            <!-- Spin Rate Slider (Rotating Cylinder - Magnus Effect) -->
+            <div class="form-group hidden" id="grp-spin">
+              <div class="label-row">
+                <label for="slider-spin">Cylinder Spin (&Omega;)</label>
+                <span id="val-spin" class="val-badge">0.0 rad/s</span>
+              </div>
+              <input type="range" id="slider-spin" min="-4.0" max="4.0" step="0.2" value="0">
+            </div>
+
+            <div class="form-group" id="grp-naca-code">
               <label for="input-naca">NACA 4-Digit Code</label>
               <div class="input-action-row">
                 <input type="text" id="input-naca" value="0012" maxlength="4" placeholder="0012">
@@ -71,10 +113,10 @@
               </div>
               <div class="quick-presets">
                 <span class="preset-label">Presets:</span>
-                <button class="chip" data-naca="0012">0012 (Symmetric)</button>
-                <button class="chip" data-naca="2412">2412 (Light Camber)</button>
-                <button class="chip" data-naca="4412">4412 (High Camber)</button>
-                <button class="chip" data-naca="6412">6412 (Turbine)</button>
+                <button class="chip" data-naca="0012">0012</button>
+                <button class="chip" data-naca="2412">2412</button>
+                <button class="chip" data-naca="4412">4412</button>
+                <button class="chip" data-naca="6412">6412</button>
               </div>
             </div>
           </div>
@@ -104,6 +146,72 @@
               </div>
               <input type="range" id="slider-inlet-angle" min="0" max="45" step="1" value="25">
             </div>
+          </div>
+        </div>
+
+        <div class="panel-section">
+          <div class="section-header-row">
+            <h2 class="section-title">Flight Conditions (ISA)</h2>
+            <span class="badge" id="isa-badge">Sea Level</span>
+          </div>
+
+          <div class="form-group">
+            <div class="label-row">
+              <label for="slider-airspeed">Airspeed (V<sub>&infin;</sub>)</label>
+              <span id="val-airspeed" class="val-badge">40.0 m/s</span>
+            </div>
+            <input type="range" id="slider-airspeed" min="10" max="150" step="1" value="40">
+          </div>
+
+          <div class="form-group">
+            <div class="label-row">
+              <label for="slider-altitude">Altitude (h)</label>
+              <span id="val-altitude" class="val-badge">0 m</span>
+            </div>
+            <input type="range" id="slider-altitude" min="0" max="12000" step="250" value="0">
+          </div>
+
+          <div class="input-row-dual">
+            <div class="form-group">
+              <label for="input-wing-area">Wing Area (m&sup2;)</label>
+              <input type="number" id="input-wing-area" value="1.0" min="0.1" max="50.0" step="0.1">
+            </div>
+            <div class="form-group">
+              <label for="input-chord">Chord (m)</label>
+              <input type="number" id="input-chord" value="1.0" min="0.1" max="10.0" step="0.1">
+            </div>
+          </div>
+
+          <div class="isa-telemetry-pill">
+            <span id="isa-rho">&rho;: 1.225 kg/m&sup3;</span>
+            <span id="isa-q">q<sub>&infin;</sub>: 980 Pa</span>
+            <span id="isa-re">Re: 2.7&times;10<sup>6</sup></span>
+          </div>
+        </div>
+
+        <div class="panel-section">
+          <h2 class="section-title">Aerodynamic Tools</h2>
+
+          <div class="toggle-group">
+            <label class="toggle-switch">
+              <input type="checkbox" id="toggle-probe">
+              <span class="slider"></span>
+            </label>
+            <span class="toggle-label">Flow Probe Crosshair</span>
+          </div>
+
+          <div class="toggle-group" style="margin-top: 10px;">
+            <label class="toggle-switch">
+              <input type="checkbox" id="toggle-vectors">
+              <span class="slider"></span>
+            </label>
+            <span class="toggle-label">Surface Pressure Vectors</span>
+          </div>
+
+          <div style="margin-top: 14px;">
+            <button id="btn-alpha-sweep" class="btn btn-block btn-sweep">
+              RUN ALPHA SWEEP (&alpha;: -4&deg; to +16&deg;)
+            </button>
           </div>
         </div>
 
@@ -144,6 +252,16 @@
               <option value="high">High Detail (256 &times; 128)</option>
             </select>
           </div>
+
+          <div class="form-group" style="margin-top: 12px;">
+            <label for="select-speed">Simulation Speed</label>
+            <select id="select-speed" class="form-select">
+              <option value="1">1x (Standard)</option>
+              <option value="2">2x (Smooth)</option>
+              <option value="3" selected>3x (Fluid Fast)</option>
+              <option value="5">5x (High Speed)</option>
+            </select>
+          </div>
         </div>
       </aside>
 
@@ -169,6 +287,19 @@
             </div>
             <div class="colorbar-title" id="cb-title">&omega;</div>
           </div>
+
+          <!-- Flow Field Probe HUD overlay -->
+          <div id="flow-probe-hud" class="probe-hud hidden">
+            <div class="probe-title">PROBE // SENSOR</div>
+            <div class="probe-grid">
+              <div class="probe-item"><span class="probe-k">x/c:</span> <span class="probe-v" id="probe-xc">+0.00</span></div>
+              <div class="probe-item"><span class="probe-k">|V|:</span> <span class="probe-v" id="probe-vel">0.0 m/s</span></div>
+              <div class="probe-item"><span class="probe-k">Static P:</span> <span class="probe-v" id="probe-p">101.3 kPa</span></div>
+              <div class="probe-item"><span class="probe-k">C<sub>p</sub>:</span> <span class="probe-v" id="probe-cp">0.00</span></div>
+              <div class="probe-item"><span class="probe-k">&omega;:</span> <span class="probe-v" id="probe-vort">0.0 s&supminus;&sup1;</span></div>
+              <div class="probe-item"><span class="probe-k">Region:</span> <span class="probe-v" id="probe-zone">FLUID</span></div>
+            </div>
+          </div>
         </div>
 
         <!-- Telemetry Bottom Bar -->
@@ -180,6 +311,14 @@
           <div class="metric-card">
             <div class="metric-label">Drag Coeff (C<sub>d</sub>)</div>
             <div class="metric-value" id="hud-cd">0.0000</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Dimensional Lift</div>
+            <div class="metric-value" id="hud-lift-n">0.0 N</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-label">Dimensional Drag</div>
+            <div class="metric-value" id="hud-drag-n">0.0 N</div>
           </div>
           <div class="metric-card">
             <div class="metric-label">Efficiency (L/D)</div>
@@ -207,7 +346,7 @@
         <div class="chart-box">
           <div class="chart-header">
             <h3>Surface Pressure Coeff (C<sub>p</sub> vs x/c)</h3>
-            <span class="badge">Inviscid / Viscous</span>
+            <span class="badge" id="cp-badge">Inviscid / Viscous</span>
           </div>
           <div class="chart-canvas-container">
             <canvas id="chart-cp"></canvas>
@@ -225,6 +364,41 @@
         </div>
       </aside>
     </main>
+  </div>
+
+  <!-- Alpha Sweep Modal -->
+  <div id="sweep-modal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <h2>AERODYNAMIC ALPHA SWEEP</h2>
+          <span class="modal-subtitle">Navier-Stokes Solver Polars: &alpha; &in; [-4&deg;, +16&deg;]</span>
+        </div>
+        <button id="btn-close-sweep" class="btn btn-sm btn-secondary">&times; CLOSE</button>
+      </div>
+      <div class="modal-body">
+        <div id="sweep-status" class="sweep-status-banner">INITIALIZING SWEEP...</div>
+        <div class="sweep-chips-row">
+          <div class="sweep-stat"><span class="k">STALL ANGLE (&alpha;<sub>stall</sub>):</span> <span class="v" id="stat-stall-alpha">--</span></div>
+          <div class="sweep-stat"><span class="k">MAX LIFT (C<sub>l,max</sub>):</span> <span class="v" id="stat-cl-max">--</span></div>
+          <div class="sweep-stat"><span class="k">ZERO-LIFT ANGLE (&alpha;<sub>0</sub>):</span> <span class="v" id="stat-zero-alpha">--</span></div>
+        </div>
+        <div class="sweep-charts-grid">
+          <div class="sweep-chart-box">
+            <div class="sweep-chart-header">Lift Curve (C<sub>l</sub> vs &alpha;)</div>
+            <div class="chart-canvas-container">
+              <canvas id="chart-sweep-lift"></canvas>
+            </div>
+          </div>
+          <div class="sweep-chart-box">
+            <div class="sweep-chart-header">Drag Polar (C<sub>l</sub> vs C<sub>d</sub>)</div>
+            <div class="chart-canvas-container">
+              <canvas id="chart-sweep-polar"></canvas>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="/static/app.js"></script>

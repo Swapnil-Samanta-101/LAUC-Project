@@ -41,6 +41,8 @@ class AerodynamicDiagnostics:
 
         cp_upper = np.zeros(n_samples, dtype=np.float64)
         cp_lower = np.zeros(n_samples, dtype=np.float64)
+        vectors: List[List[float]] = []
+        vec_scale = 0.25 * chord
 
         for idx, x_target in enumerate(x_eval):
             # Find closest cell column i
@@ -59,8 +61,32 @@ class AerodynamicDiagnostics:
                 # Lower surface: cell just below solid
                 j_low = max(j_bot_solid - 1, 0)
 
-                cp_upper[idx] = 2.0 * p[j_up, i]
-                cp_lower[idx] = 2.0 * p[j_low, i]
+                cp_up = float(2.0 * p[j_up, i])
+                cp_lo = float(2.0 * p[j_low, i])
+                cp_upper[idx] = cp_up
+                cp_lower[idx] = cp_lo
+
+                # Upper surface vectors: suction points away (+y), pressure points to surface (-y)
+                x_u = float(grid.xc[i])
+                y_u = float(grid.yc[j_top_solid] + 0.5 * grid.dy)
+                mag_u = min(abs(cp_up) * vec_scale, 0.4)
+                if cp_up <= 0.0:
+                    vectors.append([round(x_u / grid.lx, 4), round(y_u / grid.ly, 4),
+                                    round(x_u / grid.lx, 4), round(min(grid.ly, y_u + mag_u) / grid.ly, 4), 1.0])
+                else:
+                    vectors.append([round(x_u / grid.lx, 4), round(min(grid.ly, y_u + mag_u) / grid.ly, 4),
+                                    round(x_u / grid.lx, 4), round(y_u / grid.ly, 4), 0.0])
+
+                # Lower surface vectors: suction points away (-y), pressure points to surface (+y)
+                x_l = float(grid.xc[i])
+                y_l = float(grid.yc[j_bot_solid] - 0.5 * grid.dy)
+                mag_l = min(abs(cp_lo) * vec_scale, 0.4)
+                if cp_lo <= 0.0:
+                    vectors.append([round(x_l / grid.lx, 4), round(y_l / grid.ly, 4),
+                                    round(x_l / grid.lx, 4), round(max(0.0, y_l - mag_l) / grid.ly, 4), 1.0])
+                else:
+                    vectors.append([round(x_l / grid.lx, 4), round(max(0.0, y_l - mag_l) / grid.ly, 4),
+                                    round(x_l / grid.lx, 4), round(y_l / grid.ly, 4), 0.0])
             else:
                 # If chord slice not masked (e.g. sharp trailing/leading edge)
                 j_mid = grid.ny // 2
@@ -70,7 +96,8 @@ class AerodynamicDiagnostics:
         return {
             "x_c": xc_norm,
             "cp_upper": cp_upper,
-            "cp_lower": cp_lower
+            "cp_lower": cp_lower,
+            "vectors": vectors
         }
 
     @staticmethod

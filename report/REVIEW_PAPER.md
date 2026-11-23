@@ -1,7 +1,7 @@
 # A High-Fidelity 2D Incompressible Navier-Stokes Computational Fluid Dynamics Framework for Airfoil and Turbomachinery Cascade Analysis: Numerical Formulation, Immersed Boundary Methods, and Real-Time Interactive Simulation
 
 **Authors:** Senior Computational Fluid Dynamics & Aerospace Engineering Research Group  
-**Target Repository:** `LAUC Sem 1and2 FAP / report`  
+**Target Repository:** `LAUC Project / report`  
 **Date:** November 2026  
 **Classification:** Technical Review Paper & Comprehensive Engineering Monograph  
 

@@ -15,14 +15,15 @@ from reportlab.platypus import (
 )
 from reportlab.pdfgen import canvas
 
-REPORT_DIR = r"C:\Users\OneX1\LAUC Sem 1and2 FAP\report"
+REPORT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(REPORT_DIR)
 os.makedirs(REPORT_DIR, exist_ok=True)
 
 DOCX_PATH = os.path.join(REPORT_DIR, "Code_Architecture_Guide.docx")
 PDF_PATH = os.path.join(REPORT_DIR, "Code_Architecture_Guide.pdf")
 
-ROOT_DOCX = r"C:\Users\OneX1\LAUC Sem 1and2 FAP\Code_Architecture_Guide.docx"
-ROOT_PDF = r"C:\Users\OneX1\LAUC Sem 1and2 FAP\Code_Architecture_Guide.pdf"
+ROOT_DOCX = os.path.join(PROJECT_ROOT, "Code_Architecture_Guide.docx")
+ROOT_PDF = os.path.join(PROJECT_ROOT, "Code_Architecture_Guide.pdf")
 
 
 # ==============================================================================

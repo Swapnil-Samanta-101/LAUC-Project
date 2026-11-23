@@ -4,7 +4,7 @@ Implements standard NACA 4-digit profiles with camber, thickness,
 chord scaling, quarter-chord center placement, and angle of attack rotation.
 """
 
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 import numpy as np
 
 
@@ -38,7 +38,10 @@ class NACA4Airfoil:
         x_origin: float = 1.0,
         y_origin: float = 1.0,
         alpha_deg: float = 0.0,
-        n_points: int = 150
+        n_points: int = 150,
+        camber: Optional[float] = None,
+        thickness: Optional[float] = None,
+        p_loc: Optional[float] = None
     ) -> None:
         self.code = code
         self.chord = float(chord)
@@ -47,7 +50,21 @@ class NACA4Airfoil:
         self.alpha_deg = float(alpha_deg)
         self.n_points = int(n_points)
 
-        self.m, self.p, self.t = parse_naca_4digit(code)
+        parsed_m, parsed_p, parsed_t = parse_naca_4digit(code)
+        self.m = float(camber) if camber is not None else parsed_m
+        self.t = float(thickness) if thickness is not None else parsed_t
+        if p_loc is not None:
+            self.p = float(p_loc)
+        elif camber is not None:
+            self.p = parsed_p if parsed_p > 0.0 else (0.4 if self.m > 0.0 else 0.0)
+        else:
+            self.p = parsed_p
+
+        self.xc: np.ndarray = np.array([])
+        self.upper_coords: np.ndarray = np.array([])
+        self.lower_coords: np.ndarray = np.array([])
+        self.upper_normals: np.ndarray = np.array([])
+        self.lower_normals: np.ndarray = np.array([])
         self.polygon = self._generate_polygon()
 
     def _generate_polygon(self) -> np.ndarray:
@@ -113,6 +130,20 @@ class NACA4Airfoil:
 
         xu_rot, yu_rot = rotate(xu, yu)
         xl_rot, yl_rot = rotate(xl, yl)
+
+        # Outward unit surface normals after rotation
+        # Upper surface normal points outward (upwards/forwards)
+        nx_u = -np.sin(theta - alpha_rad)
+        ny_u = np.cos(theta - alpha_rad)
+        # Lower surface normal points outward (downwards/backwards)
+        nx_l = np.sin(theta - alpha_rad)
+        ny_l = -np.cos(theta - alpha_rad)
+
+        self.xc = xc
+        self.upper_coords = np.column_stack((xu_rot, yu_rot))
+        self.lower_coords = np.column_stack((xl_rot, yl_rot))
+        self.upper_normals = np.column_stack((nx_u, ny_u))
+        self.lower_normals = np.column_stack((nx_l, ny_l))
 
         # Build closed polygon: trailing edge -> upper surface -> leading edge -> lower surface -> trailing edge
         poly_upper = np.column_stack((xu_rot[::-1], yu_rot[::-1]))

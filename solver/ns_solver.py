@@ -60,7 +60,7 @@ def apply_brinkman_penalization(
     eta: float,
     dt: float
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply implicit Brinkman volume penalization: u** = u* / (1 + chi * dt / eta)."""
+    """Apply implicit Brinkman volume penalization for stationary body: u** = u* / (1 + chi * dt / eta)."""
     factor_u = dt / eta
     factor_v = dt / eta
     ny, nx_plus_1 = u.shape
@@ -74,6 +74,36 @@ def apply_brinkman_penalization(
         for i in range(nx):
             if chi_v[j, i] > 0.0:
                 v[j, i] /= (1.0 + chi_v[j, i] * factor_v)
+
+    return u, v
+
+
+@njit(fastmath=True, cache=True)
+def apply_brinkman_penalization_moving(
+    u: np.ndarray,
+    v: np.ndarray,
+    chi_u: np.ndarray,
+    chi_v: np.ndarray,
+    eta: float,
+    dt: float,
+    u_solid: np.ndarray,
+    v_solid: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Apply implicit Brinkman volume penalization for moving body (e.g. rotating cylinder)."""
+    factor = dt / eta
+    ny, nx_plus_1 = u.shape
+    for j in range(ny):
+        for i in range(nx_plus_1):
+            if chi_u[j, i] > 0.0:
+                chi_dt_eta = chi_u[j, i] * factor
+                u[j, i] = (u[j, i] + chi_dt_eta * u_solid[j, i]) / (1.0 + chi_dt_eta)
+
+    ny_plus_1, nx = v.shape
+    for j in range(ny_plus_1):
+        for i in range(nx):
+            if chi_v[j, i] > 0.0:
+                chi_dt_eta = chi_v[j, i] * factor
+                v[j, i] = (v[j, i] + chi_dt_eta * v_solid[j, i]) / (1.0 + chi_dt_eta)
 
     return u, v
 
@@ -142,11 +172,26 @@ class NavierStokesSolver:
             )
 
         # Initialize flow with inlet conditions
+        self.u_solid: Optional[np.ndarray] = None
+        self.v_solid: Optional[np.ndarray] = None
+        self.u_solid_c: Optional[np.ndarray] = None
+        self.v_solid_c: Optional[np.ndarray] = None
         self.reset_flow(u_val=self.bc.u_inlet, v_val=self.bc.v_inlet)
 
-    def set_solid_mask(self, mask_centers: np.ndarray) -> None:
+    def set_solid_mask(
+        self,
+        mask_centers: np.ndarray,
+        u_solid: Optional[np.ndarray] = None,
+        v_solid: Optional[np.ndarray] = None,
+        u_solid_c: Optional[np.ndarray] = None,
+        v_solid_c: Optional[np.ndarray] = None
+    ) -> None:
         """Set solid volume fraction mask and interpolate to u and v face locations."""
         self.chi_c = np.clip(mask_centers, 0.0, 1.0).astype(np.float64)
+        self.u_solid = u_solid
+        self.v_solid = v_solid
+        self.u_solid_c = u_solid_c
+        self.v_solid_c = v_solid_c
 
         # Face interpolation
         self.chi_u = np.zeros((self.grid.ny, self.grid.nx + 1), dtype=np.float64)
@@ -224,9 +269,15 @@ class NavierStokesSolver:
         v_star = self.v + dt * (adv_v + diff_v)
 
         # 4. Brinkman Volume Penalization
-        u_star, v_star = apply_brinkman_penalization(
-            u_star, v_star, self.chi_u, self.chi_v, self.eta_penalization, dt
-        )
+        if self.u_solid is not None and self.v_solid is not None:
+            u_star, v_star = apply_brinkman_penalization_moving(
+                u_star, v_star, self.chi_u, self.chi_v, self.eta_penalization, dt,
+                self.u_solid, self.v_solid
+            )
+        else:
+            u_star, v_star = apply_brinkman_penalization(
+                u_star, v_star, self.chi_u, self.chi_v, self.eta_penalization, dt
+            )
 
         # 5. Boundary conditions on predictor
         self.bc.apply_velocity_bc(u_star, v_star, self.grid.dx, self.grid.dy, dt)
@@ -255,16 +306,23 @@ class NavierStokesSolver:
     def compute_aerodynamic_forces(self) -> Tuple[float, float, float, float]:
         """Compute aerodynamic forces via Brinkman penalization volume integral.
 
-        F_x = integral( chi/eta * u ) dOmega
-        F_y = integral( chi/eta * v ) dOmega
+        F_x = integral( chi/eta * (u - u_solid) ) dOmega
+        F_y = integral( chi/eta * (v - v_solid) ) dOmega
         Cd = 2 * F_x / (rho * U_inf^2 * chord)
         Cl = 2 * F_y / (rho * U_inf^2 * chord)
         """
         cell_area = self.grid.dx * self.grid.dy
         u_c, v_c = self.grid.to_cell_centers(self.u, self.v)
 
-        f_x = np.sum((self.chi_c / self.eta_penalization) * u_c) * cell_area
-        f_y = np.sum((self.chi_c / self.eta_penalization) * v_c) * cell_area
+        if self.u_solid_c is not None and self.v_solid_c is not None:
+            u_rel = u_c - self.u_solid_c
+            v_rel = v_c - self.v_solid_c
+        else:
+            u_rel = u_c
+            v_rel = v_c
+
+        f_x = np.sum((self.chi_c / self.eta_penalization) * u_rel) * cell_area
+        f_y = np.sum((self.chi_c / self.eta_penalization) * v_rel) * cell_area
 
         # Non-dimensional reference: chord c = 1.0, U_inf = 1.0, rho = 1.0
         # Dynamic pressure q = 0.5 * rho * U_inf^2 * chord = 0.5
